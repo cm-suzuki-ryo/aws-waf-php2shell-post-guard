@@ -3,7 +3,7 @@
 [日本語](README.ja.md)
 
 An AWS WAF (REGIONAL) CloudFormation sample for an Application Load Balancer.
-It puts three rules (four with the optional multipart rule) in one web ACL and can return the name of the rule that stopped a request, so you can see *why* a request got a 403.
+It puts three rules (up to six with the optional ones) in one web ACL and can return the name of the rule that stopped a request, so you can see *why* a request got a 403.
 
 | Priority | Rule | Matches | Action |
 |---|---|---|---|
@@ -11,6 +11,8 @@ It puts three rules (four with the optional multipart rule) in one web ACL and c
 | 1 | `block-foreign-post` | `POST` from a country that is not in `AllowedCountries` (default `JP`) | Block (or Count) |
 | 2 | `rate-limit-post-ip` | `POST`, counted per source IP (default 10 per 60 s) | Block (or Count) |
 | 3 | `rate-limit-post-fingerprint` | `POST`, counted per TLS JA4 fingerprint (default 15 per 60 s) | Block (or Count) |
+| 4 | `block-php-upload-progress` (`BlockPhpUploadProgress`, default `true`) | The custom rule from AWS security bulletin 2026-143-AWS (CVE-2026-109619): `POST`, and `PHPSESSID` in the body or as a cookie name, and `PHP_SESSION_UPLOAD_PROGRESS` in the body | Block (or Count) |
+| 5 | `aws-crs-size-restrictions-body` (optional, `BlockLargeBody=true`) | AWS managed Core rule set with every rule except `SizeRestrictions_BODY` set to Count: request bodies over 8 KB (CVE-2026-109618 compensating control in the same bulletin) | Block (or Count) |
 
 Optional: associate the web ACL with an ALB, and send web ACL logs to CloudWatch Logs.
 
@@ -18,9 +20,10 @@ Optional: associate the web ACL with an ALB, and send web ACL logs to CloudWatch
 > It is a sample for testing WAF rules and reading their logs. Apply the PHP update as soon as it is available.
 > - GMO Flatt Security says the `session.upload_progress.enabled=0` workaround only mitigates a little, that the attack stays possible, and that the patch is the fix: <https://blog.flatt.tech/entry/php2shell>
 > - Sansec says the attack appears to hit PHP itself, before the application code or a store-level shield runs: <https://sansec.io/research/php2shell>
-> - The PHP security team announced the release (two critical issues, CVSS v4.0 9.2) without naming CVE IDs or mechanisms: <https://www.php.net/archive/2026.php#2026-10-20-1>. The CVE IDs and the name "php2shell" come from security vendors' reports.
+> - PHP released fixed versions on 2026-10-21 (8.5.12, 8.4.27, 8.3.36, 8.2.35) and says there is no complete mitigation, only the update: <https://www.php.net/archive/2026.php#2026-10-21-5>. AWS security bulletin 2026-143-AWS lists the WAF compensating controls that rules 4 and 5 implement, and also says none of them is complete: <https://aws.amazon.com/security/security-bulletins/2026-143-aws/>
+> - Before the release, the PHP security team announced it (two critical issues, CVSS v4.0 9.2) without naming CVE IDs or mechanisms: <https://www.php.net/archive/2026.php#2026-10-20-1>. The CVE IDs and the name "php2shell" come from security vendors' reports.
 >
-> Rate-based rules let requests through until the limit is exceeded (see the measurements below). Rules 0 and 1 are the only rules here that act on the first request. Rule 0 also blocks legitimate multipart forms and file uploads, so it is off by default.
+> Rate-based rules let requests through until the limit is exceeded (see the measurements below). Rules 0, 1, 4 and 5 act on the first request. Rule 0 also blocks legitimate multipart forms and file uploads, so it is off by default.
 
 ## Deploy
 
@@ -47,6 +50,8 @@ Delete the stack to remove everything it created (the web ACL, the association, 
 | `RuleAction` | `Block` | `Block` or `Count`. Custom responses apply to `Block` only. |
 | `ReturnBlockReason` | `true` | `true` returns 403 with the rule name in the body and in the `x-waf-blocked-by` header. **Use `false` in production**: it tells the client which rule and threshold stopped it. |
 | `BlockMultipartPost` | `false` | `true` adds rule 0. It blocks every `POST` whose `Content-Type` contains `multipart/form-data`, including legitimate uploads and forms without files. Enable it only for sites that need none. |
+| `BlockPhpUploadProgress` | `true` | `true` adds rule 4 (AWS's `PHP2Shell` rule). Only the first 8 KB of the body is inspected by an ALB. |
+| `BlockLargeBody` | `false` | `true` adds rule 5 (AWS managed Core rule set, only `SizeRestrictions_BODY` enforced, 700 WCU). It also blocks legitimate uploads and any POST body over 8 KB, so it is off by default. |
 | `IpRateLimit` | `10` | Minimum allowed by AWS WAF is 10. |
 | `FingerprintRateLimit` | `15` | Counted per JA4 fingerprint, across different IPs. |
 | `EvaluationWindowSec` | `60` | `60`, `120`, `300` or `600`. |
@@ -59,6 +64,8 @@ Delete the stack to remove everything it created (the web ACL, the association, 
 - **JA4 needs TLS.** The fingerprint is computed from the TLS Client Hello. The AWS WAF documentation says a request that lacks a component of the aggregation key is left out of the rate-based rule's evaluation, so use an HTTPS listener if you want rule 2 to count. (I did not test an HTTP listener.)
 - **Rules 1 and 2 use the source IP the ALB sees.** Behind another proxy or CDN that may be the proxy's address. Consider AWS WAF's forwarded-IP configuration if you need the original client address (not included in this sample).
 - **Rule 0 matches more broadly than PHP does.** In php-src (`main/SAPI.c`, `sapi_read_post_data`, read on `master` on 2026-10-21; other versions not checked), PHP lowercases the `Content-Type`, cuts it at the first `;`, `,` or space, and compares what is left with `multipart/form-data`. Rule 0 lowercases the header and checks whether it *contains* `multipart/form-data`, so it also stops every value PHP treats as multipart (including the comma-separated form) and some that PHP does not. It looks only at the `Content-Type` header; I did not test requests with several `Content-Type` headers or folded headers.
+- **Rule 4 is AWS's rule, copied as published; it is a narrow match.** It needs `PHPSESSID` (cookie name, exact and case-sensitive; or anywhere in the body) *and* `PHP_SESSION_UPLOAD_PROGRESS` in the body, with oversize handling `CONTINUE`. In my test (below) a request with a different session cookie name (`session.name` changed), a lowercase `phpsessid` cookie, or the reserved field placed after about 9 KB of other data all passed rule 4. Rule 5 stopped the 9 KB case only because the body was over 8 KB. Rule 4 does not look at `Content-Type`: a urlencoded body with both names is blocked too.
+- **Rule 5 uses a managed rule group.** It cannot return the custom response, so its 403 has no `x-waf-blocked-by` header; the WAF log shows `terminatingRuleId: aws-crs-size-restrictions-body`. The other CRS rules are overridden to Count, so they are counted in the log but do not block. The managed rule group version is not pinned.
 - **One web ACL per ALB.** When I passed `LoadBalancerArn` for an ALB that already had another web ACL, the stack update succeeded and the new web ACL started receiving the traffic. Check the existing association first.
 - **Rate-based rules are approximate.** AWS WAF documents that it applies rate limiting near the limit and does not guarantee an exact match.
 - **Cost.** AWS WAF charges for web ACLs, rules and requests, and CloudWatch Logs charges for ingestion and storage. See the AWS pricing pages.
@@ -78,6 +85,23 @@ Test ALB with an HTTPS listener (self-signed certificate) returning a fixed 200.
 | Rule 0 (`BlockMultipartPost=true`), `curl` from a workstation in Japan | 403 on the first request, with `x-waf-blocked-by: block-multipart-post`, for: standard `multipart/form-data; boundary=x`, the comma-separated form `multipart/form-data, boundary=x`, `Multipart/Form-Data`, and `multipart/form-data;charset=utf-8;boundary=x`. 200 for `application/x-www-form-urlencoded`, `text/plain`, `application/json`, `multipart/mixed`, a `PUT` with a multipart header, and a `GET` with a multipart header. The rule took effect within about 10 seconds of attaching the web ACL (the first check was already a 403; I did not measure it more precisely). Leading spaces and tabs before the value were removed before the web ACL saw the header, so that case was not exercised. |
 
 What this means: a rate-based rule is a throttle, not a gate. Even with a limit of 10, dozens of requests got through before the block took effect.
+
+### Rules 4 and 5 (added 2026-10-22, same ALB, `curl` from a workstation in Japan, `test/php_upload_progress_test.sh`)
+
+Requests contain only the field names AWS's rule looks for, with dummy values; no attack payload. Results with `BlockPhpUploadProgress=true`, `BlockLargeBody=true`, `RuleAction=Block`:
+
+| Case | Result |
+|---|---|
+| multipart POST, cookie `PHPSESSID`, field `PHP_SESSION_UPLOAD_PROGRESS` | 403, `x-waf-blocked-by: block-php-upload-progress` |
+| multipart POST, `PHPSESSID` and the reserved field both in the body | 403 |
+| urlencoded POST with both names in the body | 403 |
+| reserved field only / `PHPSESSID` only (cookie or body) | 200 |
+| `GET` with cookie, `PUT` with cookie and field | 200 |
+| lowercase `phpsessid` cookie, or another cookie name (`MYSESS`), with the field | 200 |
+| reserved field after about 9 KB of padding, cookie `PHPSESSID` | 403 from rule 5 (`SizeRestrictions_BODY`); 200 with `BlockLargeBody=false`, so rule 4 alone did not see the field |
+| benign urlencoded body of about 7 KB / about 9 KB | 200 / 403 from rule 5 |
+
+With `RuleAction=Count` and `BlockLargeBody=true` every request returned 200; the WAF log recorded the matches of rule 4 and rule 5 as `COUNT`. One run each; the rule took effect within a minute of the stack update.
 
 ## What the logs look like
 

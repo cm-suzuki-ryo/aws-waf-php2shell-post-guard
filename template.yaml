@@ -3,7 +3,9 @@ Description: >-
   AWS WAF (REGIONAL) sample for an Application Load Balancer.
   Rules: (0, optional) block POST with Content-Type multipart/form-data,
   (1) block POST from outside the allowed countries,
-  (2) rate limit POST per IP, (3) rate limit POST per TLS JA4 fingerprint.
+  (2) rate limit POST per IP, (3) rate limit POST per TLS JA4 fingerprint,
+  (4, optional, default on) block POST requests that carry PHP_SESSION_UPLOAD_PROGRESS and PHPSESSID (rule from AWS security bulletin 2026-143-AWS),
+  (5, optional) AWS managed Core rule set, only SizeRestrictions_BODY enforced (blocks request bodies over 8 KB).
   Optionally returns the name of the rule that blocked the request in the response,
   associates the web ACL with an ALB, and logs to CloudWatch Logs.
   This is a verification sample, not a complete protection: tune it for your workload.
@@ -37,6 +39,22 @@ Parameters:
       true adds rule 0, which acts on the first request: POST whose Content-Type header contains multipart/form-data
       (case-insensitive, so comma-separated and mixed-case variants match too). It also blocks legitimate file uploads and
       multipart forms, so enable it only for sites that need none.
+  BlockPhpUploadProgress:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true adds rule 4 (block-php-upload-progress), the custom rule AWS published in security bulletin 2026-143-AWS for CVE-2026-109619:
+      POST, and PHPSESSID in the body or as a cookie name, and PHP_SESSION_UPLOAD_PROGRESS in the body. It acts on the first request.
+      Only the first 8 KB of the body is inspected by an ALB.
+  BlockLargeBody:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true adds rule 5, the AWS managed Core rule set (AWSManagedRulesCommonRuleSet) with every rule except SizeRestrictions_BODY set to Count.
+      SizeRestrictions_BODY blocks request bodies over 8 KB (CVE-2026-109618 compensating control in AWS bulletin 2026-143-AWS).
+      It also blocks legitimate uploads and any other large POST, so enable it only for sites that need none. Adds 700 WCU.
   IpRateLimit:
     Type: Number
     Default: 10
@@ -72,10 +90,8 @@ Conditions:
     - !Equals [!Ref RuleAction, Block]
     - !Equals [!Ref ReturnBlockReason, "true"]
   MultipartOn: !Equals [!Ref BlockMultipartPost, "true"]
-  UseReasonMultipart: !And
-    - !Equals [!Ref RuleAction, Block]
-    - !Equals [!Ref ReturnBlockReason, "true"]
-    - !Equals [!Ref BlockMultipartPost, "true"]
+  PhpUploadProgressOn: !Equals [!Ref BlockPhpUploadProgress, "true"]
+  LargeBodyOn: !Equals [!Ref BlockLargeBody, "true"]
   HasAlb: !Not [!Equals [!Ref LoadBalancerArn, ""]]
   LoggingOn: !Equals [!Ref EnableLogging, "true"]
 
@@ -92,7 +108,7 @@ Resources:
         SampledRequestsEnabled: true
         MetricName: !Ref WebAclName
       CustomResponseBodies: !If
-        - UseReasonMultipart
+        - UseReason
         - foreign-post:
             ContentType: TEXT_PLAIN
             Content: "blocked by WAF rule: block-foreign-post (POST from outside the allowed countries)\n"
@@ -105,18 +121,10 @@ Resources:
           multipart-post:
             ContentType: TEXT_PLAIN
             Content: "blocked by WAF rule: block-multipart-post (POST with Content-Type multipart/form-data)\n"
-        - !If
-          - UseReason
-          - foreign-post:
-              ContentType: TEXT_PLAIN
-              Content: "blocked by WAF rule: block-foreign-post (POST from outside the allowed countries)\n"
-            rate-ip:
-              ContentType: TEXT_PLAIN
-              Content: !Sub "blocked by WAF rule: rate-limit-post-ip (POST rate limit per IP: ${IpRateLimit} per ${EvaluationWindowSec}s)\n"
-            rate-fingerprint:
-              ContentType: TEXT_PLAIN
-              Content: !Sub "blocked by WAF rule: rate-limit-post-fingerprint (POST rate limit per JA4 fingerprint: ${FingerprintRateLimit} per ${EvaluationWindowSec}s)\n"
-          - !Ref AWS::NoValue
+          php-upload-progress:
+            ContentType: TEXT_PLAIN
+            Content: "blocked by WAF rule: block-php-upload-progress (POST with PHP_SESSION_UPLOAD_PROGRESS and PHPSESSID)\n"
+        - !Ref AWS::NoValue
       Rules:
         # 0 (optional): POST with a multipart/form-data Content-Type -> immediate action
         - !If
@@ -266,6 +274,157 @@ Resources:
             CloudWatchMetricsEnabled: true
             SampledRequestsEnabled: true
             MetricName: !Sub "${WebAclName}-rate-limit-post-fingerprint"
+
+        # 4 (optional, default on): AWS bulletin 2026-143-AWS custom rule for CVE-2026-109619 -> immediate action
+        - !If
+          - PhpUploadProgressOn
+          - Name: block-php-upload-progress
+            Priority: 4
+            Action: !If
+              - IsBlock
+              - Block: !If
+                  - UseReason
+                  - CustomResponse:
+                      ResponseCode: 403
+                      CustomResponseBodyKey: php-upload-progress
+                      ResponseHeaders:
+                        - Name: x-waf-blocked-by
+                          Value: block-php-upload-progress
+                  - {}
+              - Count: {}
+            Statement:
+              AndStatement:
+                Statements:
+                  - ByteMatchStatement:
+                      SearchString: POST
+                      FieldToMatch:
+                        Method: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: EXACTLY
+                  - OrStatement:
+                      Statements:
+                        - ByteMatchStatement:
+                            SearchString: PHPSESSID
+                            FieldToMatch:
+                              Cookies:
+                                MatchPattern:
+                                  All: {}
+                                MatchScope: KEY
+                                OversizeHandling: CONTINUE
+                            TextTransformations:
+                              - Priority: 0
+                                Type: NONE
+                            PositionalConstraint: EXACTLY
+                        - ByteMatchStatement:
+                            SearchString: PHPSESSID
+                            FieldToMatch:
+                              Body:
+                                OversizeHandling: CONTINUE
+                            TextTransformations:
+                              - Priority: 0
+                                Type: NONE
+                            PositionalConstraint: CONTAINS
+                  - ByteMatchStatement:
+                      SearchString: PHP_SESSION_UPLOAD_PROGRESS
+                      FieldToMatch:
+                        Body:
+                          OversizeHandling: CONTINUE
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: CONTAINS
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              SampledRequestsEnabled: true
+              MetricName: !Sub "${WebAclName}-block-php-upload-progress"
+          - !Ref AWS::NoValue
+
+        # 5 (optional): AWS managed Core rule set, only SizeRestrictions_BODY (blocks bodies over 8 KB) enforced.
+        # The other rules are overridden to Count. With RuleAction=Count the whole group is set to Count.
+        # The managed rule cannot return a custom response, so the 403 has no x-waf-blocked-by header.
+        - !If
+          - LargeBodyOn
+          - Name: aws-crs-size-restrictions-body
+            Priority: 5
+            OverrideAction: !If
+              - IsBlock
+              - None: {}
+              - Count: {}
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesCommonRuleSet
+                RuleActionOverrides:
+                  - Name: NoUserAgent_HEADER
+                    ActionToUse:
+                      Count: {}
+                  - Name: UserAgent_BadBots_HEADER
+                    ActionToUse:
+                      Count: {}
+                  - Name: SizeRestrictions_QUERYSTRING
+                    ActionToUse:
+                      Count: {}
+                  - Name: SizeRestrictions_Cookie_HEADER
+                    ActionToUse:
+                      Count: {}
+                  - Name: SizeRestrictions_URIPATH
+                    ActionToUse:
+                      Count: {}
+                  - Name: EC2MetaDataSSRF_BODY
+                    ActionToUse:
+                      Count: {}
+                  - Name: EC2MetaDataSSRF_COOKIE
+                    ActionToUse:
+                      Count: {}
+                  - Name: EC2MetaDataSSRF_URIPATH
+                    ActionToUse:
+                      Count: {}
+                  - Name: EC2MetaDataSSRF_QUERYARGUMENTS
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericLFI_QUERYARGUMENTS
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericLFI_URIPATH
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericLFI_BODY
+                    ActionToUse:
+                      Count: {}
+                  - Name: RestrictedExtensions_URIPATH
+                    ActionToUse:
+                      Count: {}
+                  - Name: RestrictedExtensions_QUERYARGUMENTS
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericRFI_QUERYARGUMENTS
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericRFI_BODY
+                    ActionToUse:
+                      Count: {}
+                  - Name: GenericRFI_URIPATH
+                    ActionToUse:
+                      Count: {}
+                  - Name: CrossSiteScripting_COOKIE
+                    ActionToUse:
+                      Count: {}
+                  - Name: CrossSiteScripting_QUERYARGUMENTS
+                    ActionToUse:
+                      Count: {}
+                  - Name: CrossSiteScripting_BODY
+                    ActionToUse:
+                      Count: {}
+                  - Name: CrossSiteScripting_URIPATH
+                    ActionToUse:
+                      Count: {}
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              SampledRequestsEnabled: true
+              MetricName: !Sub "${WebAclName}-aws-crs-size-restrictions-body"
+          - !Ref AWS::NoValue
 
   AlbAssociation:
     Type: AWS::WAFv2::WebACLAssociation
