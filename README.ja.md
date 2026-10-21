@@ -3,13 +3,14 @@
 [English](README.md)
 
 ALB向けのAWS WAF(REGIONAL)をまとめて作るCloudFormationサンプルです。
-1つのWebACLに3つのルールを入れ、リクエストを止めたルールの名前をレスポンスに返せるので、403の理由が分かります。
+1つのWebACLに3つのルール(任意のmultipartルールを入れると4つ)を入れ、リクエストを止めたルールの名前をレスポンスに返せるので、403の理由が分かります。
 
 | 優先度 | ルール | 対象 | アクション |
 |---|---|---|---|
-| 0 | `block-foreign-post` | `AllowedCountries`(既定 `JP`)以外の国からの `POST` | Block(または Count) |
-| 1 | `rate-limit-post-ip` | `POST` を送信元IPごとに数える(既定 60秒に10回) | Block(または Count) |
-| 2 | `rate-limit-post-fingerprint` | `POST` をTLSのJA4フィンガープリントごとに数える(既定 60秒に15回) | Block(または Count) |
+| 0 | `block-multipart-post`(任意、`BlockMultipartPost=true`) | `Content-Type` ヘッダに `multipart/form-data` を含む `POST`(大文字小文字は区別しない) | Block(または Count) |
+| 1 | `block-foreign-post` | `AllowedCountries`(既定 `JP`)以外の国からの `POST` | Block(または Count) |
+| 2 | `rate-limit-post-ip` | `POST` を送信元IPごとに数える(既定 60秒に10回) | Block(または Count) |
+| 3 | `rate-limit-post-fingerprint` | `POST` をTLSのJA4フィンガープリントごとに数える(既定 60秒に15回) | Block(または Count) |
 
 オプションで、ALBへの関連付けと、CloudWatch LogsへのWebACLログ出力ができます。
 
@@ -19,7 +20,7 @@ ALB向けのAWS WAF(REGIONAL)をまとめて作るCloudFormationサンプルで�
 > - Sansecは、攻撃はアプリケーションのコードやストア向けのシールドより前に、PHP自体を狙うように見えるとしています: <https://sansec.io/research/php2shell>
 > - PHPのセキュリティチームは、2件の重大な脆弱性(CVSS v4.0 9.2)の修正リリースを告知していますが、CVE番号や仕組みには触れていません: <https://www.php.net/archive/2026.php#2026-10-20-1>。CVE番号と「php2shell」の名称は、セキュリティベンダーの報告によるものです。
 >
-> レートベースのルールは、上限を超えるまでリクエストを通します(下の実測を参照)。最初の1回から効くのは、このサンプルではルール0だけです。
+> レートベースのルールは、上限を超えるまでリクエストを通します(下の実測を参照)。最初の1回から効くのは、このサンプルではルール0と1だけです。ルール0は、正当なmultipartのフォームやファイルアップロードも止めるため、既定では無効です。
 
 ## デプロイ
 
@@ -42,9 +43,10 @@ aws cloudformation deploy \
 | 名前 | 既定値 | 説明 |
 |---|---|---|
 | `WebAclName` | `post-protection-sample` | メトリクス名のプレフィックスと、ロググループ名(`aws-waf-logs-<名前>`)にも使います。 |
-| `AllowedCountries` | `JP` | ルール0の対象外にする国のISO 3166 alpha-2コード(カンマ区切り)。 |
+| `AllowedCountries` | `JP` | ルール1の対象外にする国のISO 3166 alpha-2コード(カンマ区切り)。 |
 | `RuleAction` | `Block` | `Block` か `Count`。カスタムレスポンスは `Block` のときだけ有効です。 |
 | `ReturnBlockReason` | `true` | `true` だと、403の本文と `x-waf-blocked-by` ヘッダにルール名を入れます。**本番では `false` にしてください。** どのルールと閾値で止まったかを、相手に教えることになります。 |
+| `BlockMultipartPost` | `false` | `true` にするとルール0を追加します。`Content-Type` に `multipart/form-data` を含む `POST` を、正当なアップロードやファイルなしのフォームも含めて、すべて止めます。これらが不要なサイトだけで有効にしてください。 |
 | `IpRateLimit` | `10` | AWS WAFの最小値は10です。 |
 | `FingerprintRateLimit` | `15` | JA4フィンガープリントごとに数えます。IPが違っても合算されます。 |
 | `EvaluationWindowSec` | `60` | `60`、`120`、`300`、`600` のいずれか。 |
@@ -55,7 +57,7 @@ aws cloudformation deploy \
 ## 使う前に知っておくこと
 
 - **JA4にはTLSが必要です。** フィンガープリントはTLSのClient Helloから計算されます。AWS WAFのドキュメントでは、集計キーの要素が欠けたリクエストはレートベースルールの評価から外れるとされています。ルール2を効かせたいなら、HTTPSリスナーを使ってください(HTTPリスナーでは試していません)。
-- **ルール0と1は、ALBから見える送信元IPで判定します。** 別のプロキシやCDNを経由する場合、そのプロキシのアドレスになる可能性があります。必要なら、AWS WAFの転送IP(Forwarded IP)の設定を検討してください(このサンプルには含めていません)。
+- **ルール1と2は、ALBから見える送信元IPで判定します。** 別のプロキシやCDNを経由する場合、そのプロキシのアドレスになる可能性があります。必要なら、AWS WAFの転送IP(Forwarded IP)の設定を検討してください(このサンプルには含めていません)。
 - **1つのALBに関連付けられるWebACLは1つです。** すでに別のWebACLが付いているALBの `LoadBalancerArn` を渡したところ、スタックの更新は成功し、新しいWebACLが通信を受けるようになりました。先に既存の関連付けを確認してください。
 - **レートベースのルールは厳密ではありません。** AWS WAFは、上限の付近で制限をかけるだけで、正確な一致は保証しないと説明しています。
 - **費用。** AWS WAFはWebACL、ルール、リクエストに、CloudWatch Logsは取り込みと保存に課金されます。AWSの料金ページを確認してください。
@@ -68,9 +70,11 @@ HTTPSリスナー(自己署名証明書)で固定の200を返すテスト用ALB�
 |---|---|
 | `us-east-1` のCloudShell(国 `US`)からの `POST` | 3回とも最初から403。同じシェルからの `GET` は200。WAFログは `terminatingRuleId: block-foreign-post`、`country: US`、`responseCodeSent: 403`。 |
 | 東京のCloudShell(国 `JP`)からの `POST` | 3回とも200。 |
-| ルール1(60秒に10回)、東京のシェル1つから1秒に1回で60回の `POST` | 23回が通り、24回目から403。11回目の約14秒後でした。最後の `GET` は200。 |
-| ルール1(以前の実行、multipartのPOSTのみ対象)、約1秒で30回の連投 | 30回とも200。その45秒後の連投は、1回目から403。 |
-| ルール2(60秒に15回。この確認だけルール1を50回に上げた)、東京と大阪のシェルから同時に1秒に1回で各30回の `POST` | 403が始まるまでに、29 + 23 = 52回が通りました。両方のシェルのJA4は同じで、403は `rate-limit-post-fingerprint` によるものでした。 |
+| ルール2(60秒に10回)、東京のシェル1つから1秒に1回で60回の `POST` | 23回が通り、24回目から403。11回目の約14秒後でした。最後の `GET` は200。 |
+| ルール2(以前の実行、multipartのPOSTのみ対象)、約1秒で30回の連投 | 30回とも200。その45秒後の連投は、1回目から403。 |
+| ルール3(60秒に15回。この確認だけルール2を50回に上げた)、東京と大阪のシェルから同時に1秒に1回で各30回の `POST` | 403が始まるまでに、29 + 23 = 52回が通りました。両方のシェルのJA4は同じで、403は `rate-limit-post-fingerprint` によるものでした。 |
+
+| ルール0(`BlockMultipartPost=true`)、日本国内のPCからcurl | 次の形は、1回目から403で、ヘッダは `x-waf-blocked-by: block-multipart-post`: 標準の `multipart/form-data; boundary=x`、カンマ区切りの `multipart/form-data, boundary=x`、`Multipart/Form-Data`、`multipart/form-data;charset=utf-8;boundary=x`。次の形は200: `application/x-www-form-urlencoded`、`text/plain`、`application/json`、`multipart/mixed`、multipartのヘッダ付きの `PUT`、同じくヘッダ付きの `GET`。WebACLを付けてから約10秒以内に有効になりました(最初の確認がすでに403で、これより短い可能性があります)。値の前の空白やタブは、WebACLがヘッダを受け取る前に除かれていたため、その形は検証できていません。 |
 
 分かること: レートベースのルールは、門ではなくスロットルです。上限が10でも、ブロックが効くまでに数十回が通りました。
 
@@ -86,7 +90,11 @@ python3 test/send_requests.py https://<alb-dns-name>/ get 1 0
 python3 test/send_requests.py https://<alb-dns-name>/ post 30 1
 ```
 
-1リクエストごとに、ステータス、`x-waf-blocked-by` ヘッダ、レスポンス本文を表示します。証明書の検証を無効にしているので、自分のテスト用ALBにだけ使ってください。テスト中は、ALBのセキュリティグループを自分の送信元IPだけに絞ってください。
+```bash
+bash test/variants_test.sh <alb-dns-name>   # ルール0に対する、Content-Typeとメソッドの組み合わせ
+```
+
+`send_requests.py` は、1リクエストごとに、ステータス、`x-waf-blocked-by` ヘッダ、レスポンス本文を表示します。証明書の検証を無効にしているので、自分のテスト用ALBにだけ使ってください。テスト中は、ALBのセキュリティグループを自分の送信元IPだけに絞ってください。
 
 ## ライセンス
 

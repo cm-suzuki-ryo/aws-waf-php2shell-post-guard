@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   AWS WAF (REGIONAL) sample for an Application Load Balancer.
-  3 rules: (0) block POST from outside the allowed countries,
-  (1) rate limit POST per IP, (2) rate limit POST per TLS JA4 fingerprint.
+  Rules: (0, optional) block POST with Content-Type multipart/form-data,
+  (1) block POST from outside the allowed countries,
+  (2) rate limit POST per IP, (3) rate limit POST per TLS JA4 fingerprint.
   Optionally returns the name of the rule that blocked the request in the response,
   associates the web ACL with an ALB, and logs to CloudWatch Logs.
   This is a verification sample, not a complete protection: tune it for your workload.
@@ -28,6 +29,14 @@ Parameters:
     Description: >-
       true returns 403 with the rule name in the body and in the x-waf-blocked-by header (helpful for testing).
       Use false in production, because it tells the client which rule and threshold stopped it.
+  BlockMultipartPost:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      true adds rule 0, which acts on the first request: POST whose Content-Type header contains multipart/form-data
+      (case-insensitive, so comma-separated and mixed-case variants match too). It also blocks legitimate file uploads and
+      multipart forms, so enable it only for sites that need none.
   IpRateLimit:
     Type: Number
     Default: 10
@@ -62,6 +71,11 @@ Conditions:
   UseReason: !And
     - !Equals [!Ref RuleAction, Block]
     - !Equals [!Ref ReturnBlockReason, "true"]
+  MultipartOn: !Equals [!Ref BlockMultipartPost, "true"]
+  UseReasonMultipart: !And
+    - !Equals [!Ref RuleAction, Block]
+    - !Equals [!Ref ReturnBlockReason, "true"]
+    - !Equals [!Ref BlockMultipartPost, "true"]
   HasAlb: !Not [!Equals [!Ref LoadBalancerArn, ""]]
   LoggingOn: !Equals [!Ref EnableLogging, "true"]
 
@@ -78,7 +92,7 @@ Resources:
         SampledRequestsEnabled: true
         MetricName: !Ref WebAclName
       CustomResponseBodies: !If
-        - UseReason
+        - UseReasonMultipart
         - foreign-post:
             ContentType: TEXT_PLAIN
             Content: "blocked by WAF rule: block-foreign-post (POST from outside the allowed countries)\n"
@@ -88,11 +102,68 @@ Resources:
           rate-fingerprint:
             ContentType: TEXT_PLAIN
             Content: !Sub "blocked by WAF rule: rate-limit-post-fingerprint (POST rate limit per JA4 fingerprint: ${FingerprintRateLimit} per ${EvaluationWindowSec}s)\n"
-        - !Ref AWS::NoValue
+          multipart-post:
+            ContentType: TEXT_PLAIN
+            Content: "blocked by WAF rule: block-multipart-post (POST with Content-Type multipart/form-data)\n"
+        - !If
+          - UseReason
+          - foreign-post:
+              ContentType: TEXT_PLAIN
+              Content: "blocked by WAF rule: block-foreign-post (POST from outside the allowed countries)\n"
+            rate-ip:
+              ContentType: TEXT_PLAIN
+              Content: !Sub "blocked by WAF rule: rate-limit-post-ip (POST rate limit per IP: ${IpRateLimit} per ${EvaluationWindowSec}s)\n"
+            rate-fingerprint:
+              ContentType: TEXT_PLAIN
+              Content: !Sub "blocked by WAF rule: rate-limit-post-fingerprint (POST rate limit per JA4 fingerprint: ${FingerprintRateLimit} per ${EvaluationWindowSec}s)\n"
+          - !Ref AWS::NoValue
       Rules:
-        # 0: POST from outside the allowed countries -> immediate action
+        # 0 (optional): POST with a multipart/form-data Content-Type -> immediate action
+        - !If
+          - MultipartOn
+          - Name: block-multipart-post
+            Priority: 0
+            Action: !If
+              - IsBlock
+              - Block: !If
+                  - UseReason
+                  - CustomResponse:
+                      ResponseCode: 403
+                      CustomResponseBodyKey: multipart-post
+                      ResponseHeaders:
+                        - Name: x-waf-blocked-by
+                          Value: block-multipart-post
+                  - {}
+              - Count: {}
+            Statement:
+              AndStatement:
+                Statements:
+                  - ByteMatchStatement:
+                      SearchString: POST
+                      FieldToMatch:
+                        Method: {}
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+                      PositionalConstraint: EXACTLY
+                  - ByteMatchStatement:
+                      SearchString: multipart/form-data
+                      FieldToMatch:
+                        SingleHeader:
+                          Name: content-type
+                      TextTransformations:
+                        - Priority: 0
+                          Type: LOWERCASE
+                      PositionalConstraint: CONTAINS
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              SampledRequestsEnabled: true
+              MetricName: !Sub "${WebAclName}-block-multipart-post"
+          - !Ref AWS::NoValue
+
+        # 1: POST from outside the allowed countries -> immediate action
         - Name: block-foreign-post
-          Priority: 0
+          Priority: 1
           Action: !If
             - IsBlock
             - Block: !If
@@ -125,9 +196,9 @@ Resources:
             SampledRequestsEnabled: true
             MetricName: !Sub "${WebAclName}-block-foreign-post"
 
-        # 1: POST rate limit per source IP
+        # 2: POST rate limit per source IP
         - Name: rate-limit-post-ip
-          Priority: 1
+          Priority: 2
           Action: !If
             - IsBlock
             - Block: !If
@@ -159,9 +230,9 @@ Resources:
             SampledRequestsEnabled: true
             MetricName: !Sub "${WebAclName}-rate-limit-post-ip"
 
-        # 2: POST rate limit per TLS JA4 fingerprint (counts across different IPs with the same client stack)
+        # 3: POST rate limit per TLS JA4 fingerprint (counts across different IPs with the same client stack)
         - Name: rate-limit-post-fingerprint
-          Priority: 2
+          Priority: 3
           Action: !If
             - IsBlock
             - Block: !If
