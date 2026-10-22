@@ -5,7 +5,7 @@ Description: >-
   (1) block POST from outside the allowed countries,
   (2) rate limit POST per IP, (3) rate limit POST per TLS JA4 fingerprint,
   (4, optional, default on) block POST requests that carry PHP_SESSION_UPLOAD_PROGRESS and PHPSESSID (rule from AWS security bulletin 2026-143-AWS),
-  (5, optional) AWS managed Core rule set, only SizeRestrictions_BODY enforced (blocks request bodies over 8 KB).
+  (5, optional) block request bodies over 8 KB, including bodies larger than what an ALB inspects (custom rule from the AWS Security Blog on PHP2Shell mitigations).
   Optionally returns the name of the rule that blocked the request in the response,
   associates the web ACL with an ALB, and logs to CloudWatch Logs.
   This is a verification sample, not a complete protection: tune it for your workload.
@@ -52,9 +52,10 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
     Description: >-
-      true adds rule 5, the AWS managed Core rule set (AWSManagedRulesCommonRuleSet) with every rule except SizeRestrictions_BODY set to Count.
-      SizeRestrictions_BODY blocks request bodies over 8 KB (CVE-2026-109618 compensating control in AWS bulletin 2026-143-AWS).
-      It also blocks legitimate uploads and any other large POST, so enable it only for sites that need none. Adds 700 WCU.
+      true adds rule 5 (block-oversize-body): block any request whose body is over 8 KB (8,192 bytes), with oversize handling MATCH so that
+      bodies larger than the 8 KB an ALB inspects are blocked too. This is the CVE-2026-109618 compensating control described in AWS bulletin
+      2026-143-AWS and the AWS Security Blog on PHP2Shell mitigations (the managed rule SizeRestrictions_BODY does the same).
+      It also blocks legitimate uploads and any other large POST, so enable it only for sites that need none.
   IpRateLimit:
     Type: Number
     Default: 10
@@ -124,6 +125,9 @@ Resources:
           php-upload-progress:
             ContentType: TEXT_PLAIN
             Content: "blocked by WAF rule: block-php-upload-progress (POST with PHP_SESSION_UPLOAD_PROGRESS and PHPSESSID)\n"
+          oversize-body:
+            ContentType: TEXT_PLAIN
+            Content: "blocked by WAF rule: block-oversize-body (request body over 8 KB)\n"
         - !Ref AWS::NoValue
       Rules:
         # 0 (optional): POST with a multipart/form-data Content-Type -> immediate action
@@ -341,89 +345,38 @@ Resources:
               MetricName: !Sub "${WebAclName}-block-php-upload-progress"
           - !Ref AWS::NoValue
 
-        # 5 (optional): AWS managed Core rule set, only SizeRestrictions_BODY (blocks bodies over 8 KB) enforced.
-        # The other rules are overridden to Count. With RuleAction=Count the whole group is set to Count.
-        # The managed rule cannot return a custom response, so the 403 has no x-waf-blocked-by header.
+        # 5 (optional): request body over 8 KB -> immediate action.
+        # OversizeHandling MATCH also matches bodies larger than the 8 KB an ALB hands to AWS WAF.
         - !If
           - LargeBodyOn
-          - Name: aws-crs-size-restrictions-body
+          - Name: block-oversize-body
             Priority: 5
-            OverrideAction: !If
+            Action: !If
               - IsBlock
-              - None: {}
+              - Block: !If
+                  - UseReason
+                  - CustomResponse:
+                      ResponseCode: 403
+                      CustomResponseBodyKey: oversize-body
+                      ResponseHeaders:
+                        - Name: x-waf-blocked-by
+                          Value: block-oversize-body
+                  - {}
               - Count: {}
             Statement:
-              ManagedRuleGroupStatement:
-                VendorName: AWS
-                Name: AWSManagedRulesCommonRuleSet
-                RuleActionOverrides:
-                  - Name: NoUserAgent_HEADER
-                    ActionToUse:
-                      Count: {}
-                  - Name: UserAgent_BadBots_HEADER
-                    ActionToUse:
-                      Count: {}
-                  - Name: SizeRestrictions_QUERYSTRING
-                    ActionToUse:
-                      Count: {}
-                  - Name: SizeRestrictions_Cookie_HEADER
-                    ActionToUse:
-                      Count: {}
-                  - Name: SizeRestrictions_URIPATH
-                    ActionToUse:
-                      Count: {}
-                  - Name: EC2MetaDataSSRF_BODY
-                    ActionToUse:
-                      Count: {}
-                  - Name: EC2MetaDataSSRF_COOKIE
-                    ActionToUse:
-                      Count: {}
-                  - Name: EC2MetaDataSSRF_URIPATH
-                    ActionToUse:
-                      Count: {}
-                  - Name: EC2MetaDataSSRF_QUERYARGUMENTS
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericLFI_QUERYARGUMENTS
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericLFI_URIPATH
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericLFI_BODY
-                    ActionToUse:
-                      Count: {}
-                  - Name: RestrictedExtensions_URIPATH
-                    ActionToUse:
-                      Count: {}
-                  - Name: RestrictedExtensions_QUERYARGUMENTS
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericRFI_QUERYARGUMENTS
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericRFI_BODY
-                    ActionToUse:
-                      Count: {}
-                  - Name: GenericRFI_URIPATH
-                    ActionToUse:
-                      Count: {}
-                  - Name: CrossSiteScripting_COOKIE
-                    ActionToUse:
-                      Count: {}
-                  - Name: CrossSiteScripting_QUERYARGUMENTS
-                    ActionToUse:
-                      Count: {}
-                  - Name: CrossSiteScripting_BODY
-                    ActionToUse:
-                      Count: {}
-                  - Name: CrossSiteScripting_URIPATH
-                    ActionToUse:
-                      Count: {}
+              SizeConstraintStatement:
+                FieldToMatch:
+                  Body:
+                    OversizeHandling: MATCH
+                ComparisonOperator: GT
+                Size: 8192
+                TextTransformations:
+                  - Priority: 0
+                    Type: NONE
             VisibilityConfig:
               CloudWatchMetricsEnabled: true
               SampledRequestsEnabled: true
-              MetricName: !Sub "${WebAclName}-aws-crs-size-restrictions-body"
+              MetricName: !Sub "${WebAclName}-block-oversize-body"
           - !Ref AWS::NoValue
 
   AlbAssociation:

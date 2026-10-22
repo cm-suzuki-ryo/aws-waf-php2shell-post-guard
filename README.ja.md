@@ -12,7 +12,7 @@ ALB向けのAWS WAF(REGIONAL)をまとめて作るCloudFormationサンプルで�
 | 2 | `rate-limit-post-ip` | `POST` を送信元IPごとに数える(既定 60秒に10回) | Block(または Count) |
 | 3 | `rate-limit-post-fingerprint` | `POST` をTLSのJA4フィンガープリントごとに数える(既定 60秒に15回) | Block(または Count) |
 | 4 | `block-php-upload-progress`(`BlockPhpUploadProgress`、既定 `true`) | AWSセキュリティ速報 2026-143-AWS(CVE-2026-109619)のカスタムルール: `POST` で、ボディまたはCookie名に `PHPSESSID`、かつボディに `PHP_SESSION_UPLOAD_PROGRESS` を含む | Block(または Count) |
-| 5 | `aws-crs-size-restrictions-body`(任意、`BlockLargeBody=true`) | AWSマネージドのコアルールセットのうち `SizeRestrictions_BODY` 以外を Count にしたもの: 8KBを超えるリクエストボディ(同じ速報の CVE-2026-109618 向けの補完策) | Block(または Count) |
+| 5 | `block-oversize-body`(任意、`BlockLargeBody=true`) | ボディが8KB(8,192バイト)を超えるリクエスト。ALBがWAFに渡す8KBより大きいボディにも一致するよう、サイズ超過時の扱いは `MATCH`。AWS Security Blogの、PHP2Shell対策のカスタムルール(CVE-2026-109618向けの補完策) | Block(または Count) |
 
 オプションで、ALBへの関連付けと、CloudWatch LogsへのWebACLログ出力ができます。
 
@@ -21,6 +21,8 @@ ALB向けのAWS WAF(REGIONAL)をまとめて作るCloudFormationサンプルで�
 > - GMO Flatt Securityは、`session.upload_progress.enabled=0` は「ややの緩和策に留まり」、攻撃は依然として可能と見られ、根本的にはパッチが必要としています: <https://blog.flatt.tech/entry/php2shell>
 > - Sansecは、攻撃はアプリケーションのコードやストア向けのシールドより前に、PHP自体を狙うように見えるとしています: <https://sansec.io/research/php2shell>
 > - PHPは2026-10-21に修正版(8.5.12、8.4.27、8.3.36、8.2.35)をリリースし、完全な緩和策はなく更新だけが安全としています: <https://www.php.net/archive/2026.php#2026-10-21-5>。AWSセキュリティ速報 2026-143-AWS は、ルール4と5が実装するWAFの補完策を挙げつつ、いずれも完全ではないとしています: <https://aws.amazon.com/security/security-bulletins/2026-143-aws/>
+> - AWS Security Blog「Using AWS WAF to apply mitigations for PHP2Shell RCE vulnerabilities」: ルール4、5、0、2に対応するWAFのルール(セッションのアップロード進捗、multipart、ボディのサイズ上限、レート制限)、AWS WAFで守れない範囲、併用するサーバ側の設定: <https://aws.amazon.com/blogs/security/using-aws-waf-to-apply-mitigations-for-php2shell-rce-vulnerabilities-cve-2026-109618-and-cve-2026-109619/>
+> - Amazon Threat Intelligenceは、公開の4日前の2026-10-17にphp2shellの悪用の試行を確認しており、現在は広く悪用されているとしています。まだ更新できない環境では、アプリへの影響を確認したうえで、multipartのファイルアップロードのブロックを検討すること、`PHP_SESSION_UPLOAD_PROGRESS` を含むPOSTを探すことも勧めています: <https://aws.amazon.com/blogs/security/amazon-threat-intelligence-identifies-php2shell-exploitation-prior-to-public-disclosure-in-madpot/>
 > - リリース前に、PHPのセキュリティチームは、2件の重大な脆弱性(CVSS v4.0 9.2)の修正リリースを告知していますが、CVE番号や仕組みには触れていません: <https://www.php.net/archive/2026.php#2026-10-20-1>。CVE番号と「php2shell」の名称は、セキュリティベンダーの報告によるものです。
 >
 > レートベースのルールは、上限を超えるまでリクエストを通します(下の実測を参照)。最初の1回から効くのは、このサンプルではルール0、1、4、5です。ルール0は、正当なmultipartのフォームやファイルアップロードも止めるため、既定では無効です。
@@ -51,7 +53,7 @@ aws cloudformation deploy \
 | `ReturnBlockReason` | `true` | `true` だと、403の本文と `x-waf-blocked-by` ヘッダにルール名を入れます。**本番では `false` にしてください。** どのルールと閾値で止まったかを、相手に教えることになります。 |
 | `BlockMultipartPost` | `false` | `true` にするとルール0を追加します。`Content-Type` に `multipart/form-data` を含む `POST` を、正当なアップロードやファイルなしのフォームも含めて、すべて止めます。これらが不要なサイトだけで有効にしてください。 |
 | `BlockPhpUploadProgress` | `true` | `true` でルール4(AWSの `PHP2Shell` ルール)を追加します。ALBがWAFに渡すボディは先頭8KBまでです。 |
-| `BlockLargeBody` | `false` | `true` でルール5(AWSマネージドのコアルールセット。`SizeRestrictions_BODY` だけ有効、700 WCU)を追加します。正当なアップロードや8KBを超えるPOSTも止めるため、既定は無効です。 |
+| `BlockLargeBody` | `false` | `true` でルール5(`block-oversize-body`)を追加します。正当なアップロードや8KBを超えるPOSTも止めるため、既定は無効です。AWSのコアルールセットの `SizeRestrictions_BODY` も同じ働きですが、このサンプルは403にルール名を載せるため、カスタムルールにしています。 |
 | `IpRateLimit` | `10` | AWS WAFの最小値は10です。 |
 | `FingerprintRateLimit` | `15` | JA4フィンガープリントごとに数えます。IPが違っても合算されます。 |
 | `EvaluationWindowSec` | `60` | `60`、`120`、`300`、`600` のいずれか。 |
@@ -65,10 +67,21 @@ aws cloudformation deploy \
 - **ルール1と2は、ALBから見える送信元IPで判定します。** 別のプロキシやCDNを経由する場合、そのプロキシのアドレスになる可能性があります。必要なら、AWS WAFの転送IP(Forwarded IP)の設定を検討してください(このサンプルには含めていません)。
 - **ルール0は、PHPの判定より広く止まります。** php-src(`main/SAPI.c` の `sapi_read_post_data`。2026-10-21時点の `master` を読んだもので、他のバージョンは確認していません)は、`Content-Type` を小文字にし、最初の `;`、`,`、半角スペースで打ち切って、残りを `multipart/form-data` と比べます。ルール0は、ヘッダを小文字にして `multipart/form-data` を「含む」かを調べるため、PHPが multipart と判定する値(カンマ区切りを含む)はすべて止まり、PHPが判定しない値も一部止まります。見るのは `Content-Type` ヘッダだけで、`Content-Type` が複数あるリクエストや、折り返されたヘッダは試していません。
 - **ルール4はAWSが公開したルールをそのまま写したもので、一致の範囲は狭いです。** ボディかCookie名の `PHPSESSID`(Cookie名は完全一致で大文字小文字を区別)と、ボディの `PHP_SESSION_UPLOAD_PROGRESS` の両方が必要で、サイズ超過時の扱いは `CONTINUE` です。下の実測では、セッションCookie名が違う(`session.name` を変更)、小文字の `phpsessid`、予約フィールドが約9KBのデータより後ろにある、のいずれもルール4を通過しました。9KBの場合にルール5が止めたのは、ボディが8KBを超えていたためです。ルール4は `Content-Type` を見ないため、両方の名前を含むurlencodedのボディも止まります。
-- **ルール5はマネージドルールグループです。** カスタムレスポンスを返せないため、403に `x-waf-blocked-by` ヘッダは付きません。WAFログでは `terminatingRuleId: aws-crs-size-restrictions-body` になります。CRSの他のルールは Count に上書きしてあり、ログには数えられますが止めません。マネージドルールグループのバージョンは固定していません。
+- **ルール5はサイズの上限で、ボディを解析するものではありません。** ボディへの `SizeConstraintStatement` を `OversizeHandling: MATCH` で使い、ALBがWAFに渡す範囲より大きいボディを含め、8,192バイトを超えるボディをすべて止めます。CloudFrontやAPI Gatewayでは、既定の検査上限は16KBです(webACLの `AssociationConfig` で32、48、64KBに引き上げられます)。そちらへ移す場合は数値と設定を合わせてください。このテンプレートはALB(REGIONAL)専用です。AWSは、サイズの上限では、上限に収まる小さなパートヘッダを大量に送る「ヘッダの増幅」(PHPの中では何倍ものメモリを使う)を捕まえられないこと、multipartの各パートのヘッダはAWS WAFで解析できないことも述べています。すでに `AWSManagedRulesCommonRuleSet` を使っているなら、その `SizeRestrictions_BODY` が同じ働きをします。正当な通信を壊すルールは、グループごと無効にせず Count に上書きしてください。
+- **ルールの順序。** AWSのブログは、セッションのアップロード進捗とmultipartのルールを、サイズとレートのルールより先に評価するよう勧めています。ここでは、レートのルール(2、3)の優先度の数字がルール4、5より小さいため、ルール4や5が止めるリクエストも、先にレートのルールで数えられます。どちらにしても止まり、違うのは止めたルールの帰属とレートのカウンタだけです。記事で公開したルール0〜3の番号は変えませんでした。
 - **1つのALBに関連付けられるWebACLは1つです。** すでに別のWebACLが付いているALBの `LoadBalancerArn` を渡したところ、スタックの更新は成功し、新しいWebACLが通信を受けるようになりました。先に既存の関連付けを確認してください。
 - **レートベースのルールは厳密ではありません。** AWS WAFは、上限の付近で制限をかけるだけで、正確な一致は保証しないと説明しています。
 - **費用。** AWS WAFはWebACL、ルール、リクエストに、CloudWatch Logsは取り込みと保存に課金されます。AWSの料金ページを確認してください。
+
+## 併用するサーバ側の設定
+
+AWS WAFはPHPのメモリや設定を見られないため、CVE-2026-109619のうちHTTP層より下の部分は、PHPのホスト側の設定が必要です。以下はPHPの告知と上記のAWS Security Blogにある内容で、私は試していません。どれもPHPの更新(8.5.12、8.4.27、8.3.36、8.2.35)の代わりにはなりません。
+
+- `php.ini` かFPMのプール・サーバ設定で `session.upload_progress.enabled=0` にして、全ワーカーを再起動します。`ini_set()` と `.user.ini` は効きません。確認済みのセッション経路は塞ぎますが、他の亜種は塞げません。
+- CVE-2026-109618向けに、`memory_limit=-1`(アプリから上書きされないように)と、小さい `post_max_size`(アップロードが無ければ8M、あれば32M)。メモリの上限は `RLIMIT_AS` や `RLIMIT_DATA` ではなく、コンテナかcgroupの制限で掛けます。
+- PHP 8.5では `fatal_error_backtraces=0`。
+- 性能が許せば `pm.max_requests=1`。1リクエストを処理したワーカーが、次のリクエストが古い状態を再利用する前に入れ替わります。
+- エラーログを有効にして、攻撃を受けうるルートで繰り返す警告、致命的エラー、タイムアウトを確認します。エラーが無くても安全の証明にはなりません。
 
 ## 実測したこと(各1回、`ap-northeast-1`、2026-10-21)
 
@@ -98,10 +111,10 @@ HTTPSリスナー(自己署名証明書)で固定の200を返すテスト用ALB�
 | 予約フィールドだけ、または `PHPSESSID` だけ(Cookie、ボディとも) | 200 |
 | Cookie付きの `GET`、Cookieとフィールド付きの `PUT` | 200 |
 | 小文字の `phpsessid` Cookie、または別のCookie名(`MYSESS`)とフィールド | 200 |
-| 約9KBのパディングの後ろに予約フィールド、Cookie `PHPSESSID` | ルール5(`SizeRestrictions_BODY`)で403。`BlockLargeBody=false` では200で、ルール4だけではフィールドが見えていませんでした |
-| 約7KB / 約9KB の無害なurlencodedボディ | 200 / ルール5で403 |
+| 約9KBのパディングの後ろに予約フィールド、Cookie `PHPSESSID` | ルール5(`x-waf-blocked-by: block-oversize-body`)で403。`BlockLargeBody=false` では200で、ルール4だけではフィールドが見えていませんでした |
+| 約7KB / 約9KB / 約1MB の無害なurlencodedボディ | 200 / ルール5で403 / ルール5で403 |
 
-`RuleAction=Count`、`BlockLargeBody=true` ではすべて200で、WAFログにはルール4とルール5の一致が `COUNT` として記録されました。各1回の実測で、ルールはスタック更新から1分以内に効きました。
+`RuleAction=Count`、`BlockLargeBody=true` ではすべて200で、WAFログにはルール4とルール5の一致が `COUNT` として記録されました。各1回の実測で、ルールはスタック更新から1分以内に効きました。(最初の実測ではルール5にマネージドの `SizeRestrictions_BODY` を使い、許可と遮断の結果は同じでしたが、その403には `x-waf-blocked-by` ヘッダがありませんでした。)
 
 ## ログの見え方
 
@@ -117,6 +130,7 @@ python3 test/send_requests.py https://<alb-dns-name>/ post 30 1
 
 ```bash
 bash test/variants_test.sh <alb-dns-name>   # ルール0に対する、Content-Typeとメソッドの組み合わせ
+bash test/php_upload_progress_test.sh <ALBのDNS名>   # ルール4と5(フィールド名とボディのサイズだけ。攻撃のペイロードなし)
 ```
 
 `send_requests.py` は、1リクエストごとに、ステータス、`x-waf-blocked-by` ヘッダ、レスポンス本文を表示します。証明書の検証を無効にしているので、自分のテスト用ALBにだけ使ってください。テスト中は、ALBのセキュリティグループを自分の送信元IPだけに絞ってください。

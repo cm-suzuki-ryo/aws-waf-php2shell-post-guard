@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks rule 4 (block-php-upload-progress) and rule 5 (aws-crs-size-restrictions-body) against a test ALB.
+# Checks rule 4 (block-php-upload-progress) and rule 5 (block-oversize-body) against a test ALB.
 # Usage: php_upload_progress_test.sh <ALB DNS name>
 # The requests only contain the field NAMES the AWS rule looks for, with dummy values. No attack payload is sent.
 # TLS verification is disabled (-k) for a self-signed test certificate: use it only against an ALB you own.
@@ -21,6 +21,7 @@ printf 'PHP_SESSION_UPLOAD_PROGRESS=dummy&PHPSESSID=dummy' > "$D/urlenc-both.bin
 mp "$(part pad "$(head -c 9000 /dev/zero | tr '\0' 'a')")$(part PHP_SESSION_UPLOAD_PROGRESS dummy)" > "$D/mp-field-after-8k.bin"
 printf 'a=%s' "$(head -c 7000 /dev/zero | tr '\0' 'a')" > "$D/body-7k.bin"
 printf 'a=%s' "$(head -c 9000 /dev/zero | tr '\0' 'a')" > "$D/body-9k.bin"
+printf 'a=' > "$D/body-1m.bin"; head -c 1048576 /dev/zero | tr '\0' 'a' >> "$D/body-1m.bin"
 
 t() { # label method content-type cookie body-file
   local label="$1" method="$2" ct="$3" cookie="$4" body="$5" out
@@ -49,3 +50,4 @@ t "10 cookie MYSESS (other session.name) + field" POST "$MPCT" "MYSESS=dummy" "$
 t "11 field after 9 KB padding + cookie"          POST "$MPCT" "PHPSESSID=dummy" "$D/mp-field-after-8k.bin"
 t "12 benign urlencoded body ~7 KB"               POST "$FORM" "" "$D/body-7k.bin"
 t "13 benign urlencoded body ~9 KB"               POST "$FORM" "" "$D/body-9k.bin"
+t "14 benign urlencoded body ~1 MB"               POST "$FORM" "" "$D/body-1m.bin"
